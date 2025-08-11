@@ -1,6 +1,6 @@
 """
-Enhanced Legal Expert Chat Application
-Streamlit-based chat interface with optimized legal search and analysis
+Enhanced Human-like Legal Expert Chat Application
+Streamlit-based chat interface with natural conversation flow
 """
 
 import os
@@ -9,8 +9,8 @@ import streamlit as st
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
-import asyncio
 import time
+import re
 
 # Lang/OpenAI/Pinecone imports
 from langchain.agents import tool
@@ -21,51 +21,61 @@ from pinecone import Pinecone
 
 # Configure Streamlit page
 st.set_page_config(
-    page_title="🏛️ Expert Juridique Tunisien",
+    page_title="🏛️ Maître Khalil - Expert Juridique",
     page_icon="⚖️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
+# Custom CSS for a more professional, human-like interface
 st.markdown("""
 <style>
     .chat-message {
-        padding: 1rem; 
-        border-radius: 0.5rem; 
+        padding: 1.2rem; 
+        border-radius: 1rem; 
         margin-bottom: 1rem; 
         display: flex;
         flex-direction: column;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .chat-message.user {
-        background-color: #2b313e;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
-        margin-left: 20%;
+        margin-left: 15%;
+        border-bottom-right-radius: 0.3rem;
     }
     .chat-message.assistant {
-        background-color: #475063;
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
         color: white;
-        margin-right: 20%;
+        margin-right: 15%;
+        border-bottom-left-radius: 0.3rem;
     }
-    .chat-message .avatar {
-        width: 50px;
-        height: 50px;
-        border-radius: 50%;
-        object-fit: cover;
-        margin-bottom: 10px;
+    .expert-name {
+        font-weight: bold;
+        font-size: 1.1em;
+        margin-bottom: 0.5rem;
+        opacity: 0.9;
+    }
+    .thinking-indicator {
+        font-style: italic;
+        opacity: 0.7;
+        font-size: 0.9em;
     }
     .source-citation {
-        background-color: #f0f2f6;
-        padding: 0.5rem;
-        border-left: 4px solid #ff6b6b;
-        margin: 0.5rem 0;
-        border-radius: 0.3rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        padding: 1rem;
+        background: rgba(255,255,255,0.2);
+        padding: 0.8rem;
+        border-left: 4px solid #fff;
+        margin: 1rem 0;
         border-radius: 0.5rem;
-        border: 1px solid #dee2e6;
+        backdrop-filter: blur(10px);
+    }
+    .legal-reference {
+        background: rgba(255,255,255,0.15);
+        padding: 0.5rem;
+        border-radius: 0.3rem;
+        margin: 0.3rem 0;
+        font-family: 'Courier New', monospace;
+        font-size: 0.9em;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -75,25 +85,26 @@ st.markdown("""
 def initialize_connections():
     """Initialize all connections with caching for better performance"""
     
-    # Get API keys from Streamlit secrets or environment
     try:
         OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
         PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
     except:
         OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
         PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-    
+
+
     if not OPENAI_API_KEY or not PINECONE_API_KEY:
-        st.error("⚠️ API keys not configured. Please set OPENAI_API_KEY and PINECONE_API_KEY in secrets.toml or environment variables.")
+        st.error("⚠️ Les clés API ne sont pas configurées. Veuillez définir OPENAI_API_KEY et PINECONE_API_KEY.")
         st.stop()
     
     # Configuration
     PINECONE_ENV = "us-east-1"
     PINECONE_INDEX = "tunisia-laws"
     
-    # Models
-    RERANK_MODEL = "gpt-5-mini"
-    SYNTHESIS_MODEL = "gpt-5"
+    # Models for different purposes
+    CHAT_MODEL = "gpt-4o"  # For natural conversation
+    ANALYSIS_MODEL = "gpt-4o"  # For deep legal analysis
+    RERANK_MODEL = "gpt-4o-mini"  # For document ranking
     EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
     
     # Initialize connections
@@ -101,409 +112,536 @@ def initialize_connections():
     index = pc.Index(PINECONE_INDEX)
     
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY, model=EMBEDDING_MODEL_NAME)
-    vector_store = PineconeVectorStore(index=index, embedding=embeddings, text_key="content")
+    
+    # Fix: Create custom vector store that handles the content field correctly
+    class TunisianLegalVectorStore(PineconeVectorStore):
+
+        def similarity_search_with_score(self, query: str, k: int = 4, filter: Optional[dict] = None, **kwargs) -> List[Tuple]:
+            """Override to handle our document structure"""
+            results = []
+            try:
+                # Query Pinecone directly
+                query_vector = self._embedding.embed_query(query)
+                pinecone_results = self._index.query(
+                    vector=query_vector,
+                    top_k=k,
+                    include_metadata=True,
+                    filter=filter
+                )
+                
+                for match in pinecone_results.matches:
+                    metadata = match.metadata
+                    
+                    # Extract content based on available fields
+                    content = ""
+                    if 'content_fr' in metadata and metadata['content_fr']:
+                        content = metadata['content_fr']
+                    elif 'content_ar' in metadata and metadata['content_ar']:
+                        content = metadata['content_ar']
+                    elif 'summary' in metadata:
+                        content = metadata['summary']
+                    else:
+                        continue  # Skip if no content found
+                    
+                    # Create document-like object
+                    doc = type('Document', (), {
+                        'page_content': content,
+                        'metadata': metadata
+                    })()
+                    
+                    results.append((doc, match.score))
+                    
+            except Exception as e:
+                st.error(f"Erreur lors de la recherche: {e}")
+                
+            return results
+        
+        def similarity_search(self, query: str, k: int = 4, filter: Optional[dict] = None, **kwargs):
+            """Override similarity_search to use our custom method"""
+            docs_and_scores = self.similarity_search_with_score(query, k=k, filter=filter, **kwargs)
+            return [doc for doc, score in docs_and_scores]
+    
+    vector_store = TunisianLegalVectorStore(index=index, embedding=embeddings, text_key="content")
     
     # LLM clients
+    llm_chat = ChatOpenAI(api_key=OPENAI_API_KEY, model=CHAT_MODEL, temperature=0.7)
+    llm_analysis = ChatOpenAI(api_key=OPENAI_API_KEY, model=ANALYSIS_MODEL, temperature=0.3)
     llm_rerank = ChatOpenAI(api_key=OPENAI_API_KEY, model=RERANK_MODEL, temperature=0)
-    llm_synth = ChatOpenAI(api_key=OPENAI_API_KEY, model=SYNTHESIS_MODEL, temperature=0.1)
     
     return {
         "vector_store": vector_store,
+        "llm_chat": llm_chat,
+        "llm_analysis": llm_analysis,
         "llm_rerank": llm_rerank,
-        "llm_synth": llm_synth,
         "index": index
     }
 
 # Initialize connections
 connections = initialize_connections()
 vector_store = connections["vector_store"]
+llm_chat = connections["llm_chat"]
+llm_analysis = connections["llm_analysis"]
 llm_rerank = connections["llm_rerank"]
-llm_synth = connections["llm_synth"]
-index = connections["index"]
 
 # --- Enhanced Data Classes ---
 @dataclass
-class SearchResult:
+class LegalDocument:
     id: str
-    score: float
-    metadata: Dict[str, Any]
-    excerpt: str
-    full_content: str
+    title: str
+    article_number: int
+    content_fr: str
+    content_ar: str
+    legal_code: str
+    summary: str
+    tags: List[str]
+    status: str
     relevance_score: float = 0.0
-    rationale: str = ""
-
+    
 @dataclass
-class ChatMetrics:
-    search_time: float
-    rerank_time: float
-    synthesis_time: float
-    total_docs_retrieved: int
-    final_docs_used: int
+class ConversationContext:
+    user_question: str
+    detected_language: str
+    legal_domain: str
+    complexity_level: str
+    follow_up_questions: List[str]
 
-# --- Enhanced Core Functions ---
-class LegalExpertChatbot:
+# --- Human-like Legal Expert Class ---
+class MaitreKhalil:
     def __init__(self):
+        self.name = "Maître Khalil Ben Ahmed"
+        self.specialties = [
+            "Droit commercial tunisien",
+            "Droit civil et obligations",
+            "Droit pénal des affaires",
+            "Comptabilité publique",
+            "Procédures juridiques"
+        ]
         self.vector_store = vector_store
+        self.llm_chat = llm_chat
+        self.llm_analysis = llm_analysis
         self.llm_rerank = llm_rerank
-        self.llm_synth = llm_synth
         
-    def _build_candidates_from_search(self, docs: List[Any]) -> List[SearchResult]:
-        """Convert langchain Document results to SearchResult objects"""
-        candidates = []
-        for i, d in enumerate(docs):
-            meta = d.metadata if hasattr(d, "metadata") else {}
-            text = d.page_content if hasattr(d, "page_content") else str(d)
-            excerpt = self._create_smart_excerpt(text, max_length=600)
-            
-            candidates.append(SearchResult(
-                id=str(meta.get("id", i)),
-                score=getattr(d, 'score', 0.0),
-                metadata=meta,
-                excerpt=excerpt,
-                full_content=text
-            ))
-        return candidates
+    def _detect_language_and_context(self, query: str) -> ConversationContext:
+        """Analyze the query to understand context and user needs"""
+        
+        # Simple language detection
+        arabic_chars = len(re.findall(r'[\u0600-\u06FF]', query))
+        total_chars = len(query.replace(' ', ''))
+        detected_language = "ar" if arabic_chars > total_chars * 0.3 else "fr"
+        
+        # Detect legal domain based on keywords
+        domain_keywords = {
+            "commercial": ["commerce", "entreprise", "société", "contrat commercial", "تجارة", "شركة"],
+            "civil": ["mariage", "divorce", "succession", "propriété", "زواج", "طلاق", "ميراث"],
+            "penal": ["crime", "délit", "sanction", "prison", "جريمة", "عقوبة"],
+            "public": ["administration", "finances publiques", "comptabilité", "إدارة", "مالية عامة"],
+            "procedure": ["procédure", "tribunal", "recours", "إجراءات", "محكمة"]
+        }
+        
+        legal_domain = "general"
+        for domain, keywords in domain_keywords.items():
+            if any(keyword.lower() in query.lower() for keyword in keywords):
+                legal_domain = domain
+                break
+        
+        # Assess complexity
+        complexity_indicators = ["exception", "recours", "cassation", "constitutionnel", "استثناء", "طعن"]
+        complexity_level = "complex" if any(ind.lower() in query.lower() for ind in complexity_indicators) else "standard"
+        
+        return ConversationContext(
+            user_question=query,
+            detected_language=detected_language,
+            legal_domain=legal_domain,
+            complexity_level=complexity_level,
+            follow_up_questions=[]
+        )
     
-    def _create_smart_excerpt(self, text: str, max_length: int = 600) -> str:
-        """Create intelligent excerpt that preserves sentence boundaries"""
-        if len(text) <= max_length:
-            return text.strip()
+    def _search_legal_documents(self, query: str, legal_code: Optional[str] = None, top_k: int = 15) -> List[LegalDocument]:
+        """Search for relevant legal documents"""
         
-        # Try to cut at sentence boundary
-        excerpt = text[:max_length]
-        last_period = excerpt.rfind('.')
-        last_question = excerpt.rfind('?')
-        last_exclamation = excerpt.rfind('!')
-        
-        last_sentence_end = max(last_period, last_question, last_exclamation)
-        
-        if last_sentence_end > max_length * 0.7:  # If we can preserve 70% and get full sentence
-            return text[:last_sentence_end + 1].strip()
-        else:
-            return excerpt.strip() + "..."
-    
-    def enhanced_rerank_with_llm(self, user_query: str, candidates: List[SearchResult], top_n: int = 5) -> Tuple[List[SearchResult], float]:
-        """Enhanced reranking with timing and better prompts"""
-        start_time = time.time()
-        
-        if not candidates:
-            return [], 0.0
-        
-        # Prepare items for ranking
-        items_for_ranking = []
-        for c in candidates:
-            title = c.metadata.get("title") or c.metadata.get("article_number") or f"Document {c.id}"
-            legal_code = c.metadata.get("legal_code", "")
+        try:
+            # Build filter
+            filter_dict = {}
+            if legal_code and legal_code != "all":
+                filter_dict["legal_code"] = {"$eq": legal_code}
             
-            items_for_ranking.append({
-                "id": c.id,
-                "title": title,
-                "legal_code": legal_code,
-                "excerpt": c.excerpt
+            # Search with our custom vector store
+            docs_with_scores = vector_store.similarity_search_with_score(
+                query, 
+                k=top_k, 
+                filter=filter_dict
+            )
+            
+            legal_docs = []
+            for doc, score in docs_with_scores:
+                metadata = doc.metadata
+                
+                legal_doc = LegalDocument(
+                    id=metadata.get("id", "unknown"),
+                    title=metadata.get("title", "Document sans titre"),
+                    article_number=metadata.get("article_index", 0),
+                    content_fr=metadata.get("content_fr", ""),
+                    content_ar=metadata.get("content_ar", ""),
+                    legal_code=metadata.get("legal_code", ""),
+                    summary=metadata.get("summary", ""),
+                    tags=metadata.get("tags", []),
+                    status=metadata.get("status", ""),
+                    relevance_score=float(score)
+                )
+                legal_docs.append(legal_doc)
+            
+            return legal_docs
+            
+        except Exception as e:
+            st.error(f"Erreur lors de la recherche: {e}")
+            return []
+    
+    def _rerank_documents(self, context: ConversationContext, documents: List[LegalDocument]) -> List[LegalDocument]:
+        """Intelligently rerank documents based on context"""
+        
+        if not documents:
+            return []
+        
+        # Prepare documents for ranking
+        docs_for_ranking = []
+        for doc in documents:
+            content = doc.content_fr if context.detected_language == "fr" else doc.content_ar
+            if not content:  # Fallback to the other language
+                content = doc.content_ar if context.detected_language == "fr" else doc.content_fr
+            
+            docs_for_ranking.append({
+                "id": doc.id,
+                "title": doc.title,
+                "article_number": doc.article_number,
+                "legal_code": doc.legal_code,
+                "content": content[:800],  # Truncate for ranking
+                "summary": doc.summary,
+                "tags": doc.tags
             })
         
-        # Enhanced reranking prompt
-        system_prompt = """Vous êtes un expert en droit tunisien spécialisé dans l'évaluation de la pertinence juridique.
+        rerank_prompt = f"""En tant qu'expert juridique tunisien, évaluez la pertinence de chaque document pour cette question:
 
-Analysez chaque document par rapport à la question de l'utilisateur et attribuez un score de pertinence (0-100) avec une justification concise.
-
-Critères d'évaluation:
-- Pertinence directe (50 points max): Le document répond-il directement à la question?
-- Pertinence contextuelle (30 points max): Le document fournit-il un contexte juridique utile?
-- Qualité juridique (20 points max): Le document est-il une source juridique fiable?
-
-Répondez en JSON valide uniquement:
-{"rankings": [{"id": "...", "score": 0-100, "rationale": "justification en une phrase"}, ...]}"""
-        
-        user_prompt = f"""Question de l'utilisateur: {user_query}
+Question: {context.user_question}
+Domaine juridique détecté: {context.legal_domain}
+Niveau de complexité: {context.complexity_level}
 
 Documents à évaluer:
-{json.dumps(items_for_ranking, ensure_ascii=False, indent=2)}"""
-        
+{json.dumps(docs_for_ranking, ensure_ascii=False, indent=2)}
+
+Donnez un score de pertinence (0-100) pour chaque document. Considérez:
+- Pertinence directe au problème juridique
+- Applicabilité en droit tunisien
+- Niveau de détail approprié
+
+Répondez uniquement en JSON:
+{{"rankings": [{{"id": "...", "score": 0-100, "rationale": "..."}}]}}"""
+
         try:
-            response = self.llm_rerank.invoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ])
+            response = self.llm_rerank.invoke([{"role": "user", "content": rerank_prompt}])
+            rankings_data = json.loads(response.content.strip())
             
-            content = response.content.strip()
+            # Apply new scores
+            id_to_score = {r["id"]: r["score"] for r in rankings_data.get("rankings", [])}
+            for doc in documents:
+                doc.relevance_score = id_to_score.get(doc.id, doc.relevance_score)
             
-            # Parse JSON response
-            try:
-                rankings_data = json.loads(content)
-            except json.JSONDecodeError:
-                # Fallback parsing
-                import re
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    rankings_data = json.loads(json_match.group())
-                else:
-                    # Fallback: return original order with equal scores
-                    for c in candidates:
-                        c.relevance_score = 50.0
-                    return candidates[:top_n], time.time() - start_time
-            
-            # Apply scores and rationales
-            id_to_ranking = {str(r["id"]): r for r in rankings_data.get("rankings", [])}
-            
-            for c in candidates:
-                ranking_info = id_to_ranking.get(str(c.id), {})
-                c.relevance_score = float(ranking_info.get("score", 0))
-                c.rationale = ranking_info.get("rationale", "")
-            
-            # Sort by relevance score
-            reranked = sorted(candidates, key=lambda x: x.relevance_score, reverse=True)
-            
-            return reranked[:top_n], time.time() - start_time
+            # Sort by new relevance score
+            return sorted(documents, key=lambda x: x.relevance_score, reverse=True)[:5]
             
         except Exception as e:
-            st.error(f"Erreur lors du re-classement: {str(e)}")
-            return candidates[:top_n], time.time() - start_time
+            st.warning(f"Problème avec le re-classement: {e}")
+            return documents[:5]
     
-    def intelligent_search(self, query: str, legal_code: Optional[str] = None, top_k: int = 20, return_top: int = 5) -> Tuple[List[SearchResult], ChatMetrics]:
-        """Enhanced search with comprehensive metrics"""
-        start_time = time.time()
+    def _generate_human_response(self, context: ConversationContext, relevant_docs: List[LegalDocument]) -> str:
+        """Generate a natural, human-like response"""
         
-        # Search phase
-        search_start = time.time()
-        filter_dict = {"legal_code": {"$eq": legal_code}} if legal_code else {}
-        docs = self.vector_store.similarity_search(query, k=top_k, filter=filter_dict)
-        search_time = time.time() - search_start
+        if not relevant_docs:
+            return self._generate_no_results_response(context)
         
-        # Convert to candidates
-        candidates = self._build_candidates_from_search(docs)
+        # Prepare legal context
+        legal_context = []
+        for doc in relevant_docs:
+            content = doc.content_fr if context.detected_language == "fr" else doc.content_ar
+            if not content:
+                content = doc.content_ar if context.detected_language == "fr" else doc.content_fr
+            
+            legal_context.append({
+                "article": doc.article_number,
+                "title": doc.title,
+                "code": doc.legal_code,
+                "content": content,
+                "summary": doc.summary,
+                "status": doc.status,
+                "relevance": doc.relevance_score
+            })
         
-        # Rerank phase
-        rerank_start = time.time()
-        reranked_candidates, rerank_duration = self.enhanced_rerank_with_llm(query, candidates, top_n=return_top)
-        
-        metrics = ChatMetrics(
-            search_time=search_time,
-            rerank_time=rerank_duration,
-            synthesis_time=0.0,  # Will be updated later
-            total_docs_retrieved=len(docs),
-            final_docs_used=len(reranked_candidates)
-        )
-        
-        return reranked_candidates, metrics
-    
-    def generate_expert_answer(self, user_question: str, legal_code: Optional[str] = None, max_docs: int = 5) -> Tuple[str, ChatMetrics]:
-        """Generate comprehensive answer with citations and metrics"""
-        
-        # Search and rerank
-        search_results, metrics = self.intelligent_search(
-            user_question, 
-            legal_code=legal_code, 
-            top_k=20, 
-            return_top=max_docs
-        )
-        
-        if not search_results:
-            return "Désolé, je n'ai pas trouvé de documents pertinents pour répondre à votre question.", metrics
-        
-        # Synthesis phase
-        synthesis_start = time.time()
-        
-        # Prepare context for synthesis
-        context_documents = []
-        for result in search_results:
-            doc_info = {
-                "id": result.id,
-                "title": result.metadata.get("title", "Document sans titre"),
-                "article_number": result.metadata.get("article_number", ""),
-                "legal_code": result.metadata.get("legal_code", ""),
-                "url": result.metadata.get("url_fr") or result.metadata.get("url", ""),
-                "relevance_score": result.relevance_score,
-                "excerpt": result.excerpt,
-                "rationale": result.rationale
-            }
-            context_documents.append(doc_info)
-        
-        # Enhanced synthesis prompt
-        synthesis_system = """Vous êtes un expert juriste tunisien hautement qualifié avec une expertise approfondie en droit tunisien.
+        # Create human-like persona prompt
+        persona_prompt = f"""Vous êtes Maître Khalil Ben Ahmed, un avocat tunisien expérimenté avec 20 ans d'expérience.
 
-Votre mission:
-1. Analyser la question juridique posée
-2. Fournir une réponse précise et complète basée sur les documents fournis
-3. Citer explicitement les sources avec le format: [Article X — Code Y]
-4. Inclure des extraits pertinents entre guillemets quand c'est utile
-5. Signaler les zones d'incertitude juridique s'il y en a
-6. Recommander des étapes supplémentaires si nécessaire
+VOTRE PERSONNALITÉ:
+- Chaleureux et accessible, mais professionnel
+- Vous expliquez le droit de manière claire et pédagogique
+- Vous utilisez des exemples concrets
+- Vous êtes prudent et mentionnez quand consulter un avocat
+- Vous maîtrisez parfaitement le français et l'arabe
+- Vous avez une connaissance approfondie du droit tunisien
 
-Structure de réponse:
-- Réponse directe à la question
-- Analyse juridique détaillée
-- Citations et références
-- Recommandations pratiques (si applicables)
+STYLE DE COMMUNICATION:
+- Commencez par une salutation personnelle
+- Structurez votre réponse clairement
+- Utilisez "En droit tunisien..." ou "Selon la législation..."
+- Terminez par des conseils pratiques
+- Soyez empathique aux préoccupations du client
 
-Ton: Professionnel, précis, et accessible."""
-        
-        synthesis_user = f"""Question: {user_question}
+QUESTION DU CLIENT: {context.user_question}
 
-Documents juridiques pertinents:
-{json.dumps(context_documents, ensure_ascii=False, indent=2)}
+CONTEXTE JURIDIQUE PERTINENT:
+{json.dumps(legal_context, ensure_ascii=False, indent=2)}
 
-Fournissez une analyse juridique complète avec citations appropriées."""
-        
+Répondez comme un vrai avocat tunisien le ferait lors d'une consultation. Soyez naturel, professionnel et rassurant."""
+
         try:
-            response = self.llm_synth.invoke([
-                {"role": "system", "content": synthesis_system},
-                {"role": "user", "content": synthesis_user}
-            ])
+            response = self.llm_chat.invoke([{"role": "user", "content": persona_prompt}])
+            base_response = response.content.strip()
             
-            answer = response.content.strip()
+            # Add legal references in a natural way
+            if relevant_docs:
+                base_response += "\n\n📋 **Références juridiques consultées:**\n"
+                for i, doc in enumerate(relevant_docs[:3], 1):
+                    base_response += f"{i}. Article {doc.article_number} - {doc.title} ({doc.legal_code})\n"
+                    if doc.status:
+                        base_response += f"   *{doc.status}*\n"
             
-            # Add sources section
-            sources_section = "\n\n📚 **Sources consultées:**\n"
-            for i, result in enumerate(search_results, 1):
-                title = result.metadata.get("title", "Document sans titre")
-                code = result.metadata.get("legal_code", "Code non spécifié")
-                url = result.metadata.get("url_fr") or result.metadata.get("url", "")
-                score = result.relevance_score
-                
-                sources_section += f"{i}. **{title}** | {code} | Score: {score:.1f}/100"
-                if url:
-                    sources_section += f" | [Lien]({url})"
-                sources_section += "\n"
-            
-            final_answer = answer + sources_section
-            
-            metrics.synthesis_time = time.time() - synthesis_start
-            
-            return final_answer, metrics
+            return base_response
             
         except Exception as e:
-            metrics.synthesis_time = time.time() - synthesis_start
-            return f"Erreur lors de la génération de la réponse: {str(e)}", metrics
+            return f"Je suis désolé, j'ai rencontré un problème technique. Pouvez-vous reformuler votre question ? (Erreur: {e})"
+    
+    def _generate_no_results_response(self, context: ConversationContext) -> str:
+        """Generate a helpful response when no relevant documents are found"""
+        
+        responses = [
+            f"Je comprends votre question sur {context.legal_domain}, mais je n'ai pas trouvé de textes juridiques spécifiques dans ma base de données actuelle.",
+            "Permettez-moi de vous orienter différemment. Pouvez-vous me donner plus de détails sur votre situation ?",
+            "En attendant, je vous recommande de consulter directement un confrère spécialisé pour une analyse personnalisée."
+        ]
+        
+        if context.legal_domain != "general":
+            responses.append(f"Pour les questions de {context.legal_domain}, il serait peut-être utile de consulter directement le code concerné.")
+        
+        return "\n\n".join(responses)
+    
+    def respond_to_question(self, user_input: str, legal_code_filter: Optional[str] = None) -> Tuple[str, Dict]:
+        """Main method to process user question and generate response"""
+        
+        # Analyze context
+        context = self._detect_language_and_context(user_input)
+        
+        # Search for relevant documents
+        documents = self._search_legal_documents(
+            user_input, 
+            legal_code=legal_code_filter,
+            top_k=15
+        )
+        
+        # Rerank based on context
+        relevant_docs = self._rerank_documents(context, documents)
+        
+        # Generate human-like response
+        response = self._generate_human_response(context, relevant_docs)
+        
+        # Prepare metadata for UI
+        metadata = {
+            "detected_language": context.detected_language,
+            "legal_domain": context.legal_domain,
+            "documents_found": len(documents),
+            "documents_used": len(relevant_docs),
+            "complexity": context.complexity_level
+        }
+        
+        return response, metadata
 
 # --- Streamlit Interface ---
 def main():
-    st.title("🏛️ Expert Juridique Tunisien")
-    st.markdown("*Assistant juridique intelligent spécialisé en droit tunisien*")
+    # Header with expert introduction
+    st.markdown("""
+    <div style='text-align: center; padding: 2rem 0;'>
+        <h1>🏛️ Maître Khalil Ben Ahmed</h1>
+        <h3 style='color: #666; font-weight: normal;'>Avocat & Expert en Droit Tunisien</h3>
+        <p style='font-style: italic; color: #888;'>Spécialisé en droit commercial, civil et comptabilité publique</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Sidebar configuration
+    # Sidebar with expert profile
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.markdown("""
+        ### 👨‍⚖️ Profil de l'Expert
+        
+        **Maître Khalil Ben Ahmed**
+        - 🎓 20+ ans d'expérience
+        - 🏛️ Droit tunisien
+        - 📚 Spécialités multiples
+        - 🌐 Bilingue FR/AR
+        
+        ---
+        """)
         
         # Legal code filter
-        legal_codes = [
-            "Tous les codes",
-            "code-commerce",
-            "code-civil",
-            "code-penal",
-            "code-travail",
-            "code-procedure-civile"
-        ]
+        st.subheader("🔍 Filtrer par domaine")
+        legal_codes = {
+            "Tous les domaines": None,
+            "📊 Comptabilité publique": "code-comptabilite-publique",
+            "🏢 Droit commercial": "code-commerce",
+            "👥 Droit civil": "code-civil",
+            "⚖️ Droit pénal": "code-penal",
+            "💼 Droit du travail": "code-travail",
+            "📋 Procédure civile": "code-procedure-civile"
+        }
         
-        selected_code = st.selectbox(
-            "Code juridique",
-            legal_codes,
-            help="Filtrer par type de code juridique"
+        selected_code_display = st.selectbox(
+            "Domaine juridique",
+            list(legal_codes.keys()),
+            help="Concentrer la recherche sur un domaine spécifique"
         )
+        selected_code = legal_codes[selected_code_display]
         
-        legal_code_filter = None if selected_code == "Tous les codes" else selected_code
+        # Expert availability status
+        st.markdown("""
+        ---
+        ### 📊 Statut
+        🟢 **En ligne** - Réponse immédiate  
+        📖 Base juridique à jour  
+        🔒 Consultations confidentielles
+        """)
         
-        # Advanced settings
-        with st.expander("🔧 Paramètres avancés"):
-            max_docs = st.slider("Nombre max de documents", 3, 10, 5)
-            show_metrics = st.checkbox("Afficher les métriques", value=True)
-            show_sources_detail = st.checkbox("Détails des sources", value=False)
-        
-        # Statistics
-        st.markdown("---")
-        st.markdown("📊 **Statistiques de session**")
-        if 'chat_count' not in st.session_state:
-            st.session_state.chat_count = 0
-        st.metric("Questions posées", st.session_state.chat_count)
+        # Quick tips
+        with st.expander("💡 Conseils pour de meilleures réponses"):
+            st.markdown("""
+            - Soyez spécifique dans vos questions
+            - Mentionnez le contexte (personnel/entreprise)
+            - Précisez si c'est urgent
+            - N'hésitez pas à demander des clarifications
+            """)
     
-    # Initialize chat history
+    # Initialize chat
     if "messages" not in st.session_state:
         st.session_state.messages = []
-        st.session_state.chat_metrics = []
+        # Add welcome message
+        welcome_msg = """Bonjour ! Je suis Maître Khalil Ben Ahmed, avocat spécialisé en droit tunisien.
+
+Je suis là pour vous aider avec vos questions juridiques, que ce soit en droit commercial, civil, pénal, ou comptabilité publique. 
+
+N'hésitez pas à me poser votre question en français ou en arabe. Je vous donnerai une réponse claire avec les références juridiques appropriées.
+
+Comment puis-je vous aider aujourd'hui ? 😊"""
+        
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": welcome_msg,
+            "metadata": {}
+        })
     
-    # Initialize chatbot
-    if "chatbot" not in st.session_state:
-        st.session_state.chatbot = LegalExpertChatbot()
+    if "expert" not in st.session_state:
+        st.session_state.expert = MaitreKhalil()
     
     # Display chat history
-    for i, message in enumerate(st.session_state.messages):
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                st.markdown(f'<div class="expert-name">👨‍⚖️ Maître Khalil</div>', unsafe_allow_html=True)
+            
             st.markdown(message["content"])
             
-            # Show metrics if available and enabled
+            # Show metadata for assistant messages (except welcome)
             if (message["role"] == "assistant" and 
-                show_metrics and 
-                i < len(st.session_state.chat_metrics)):
+                message.get("metadata") and 
+                len(message["metadata"]) > 0):
                 
-                metrics = st.session_state.chat_metrics[i // 2]  # Every other message is assistant
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("⏱️ Recherche", f"{metrics.search_time:.2f}s")
-                with col2:
-                    st.metric("🔄 Re-classement", f"{metrics.rerank_time:.2f}s")
-                with col3:
-                    st.metric("✍️ Synthèse", f"{metrics.synthesis_time:.2f}s")
-                with col4:
-                    st.metric("📄 Documents", f"{metrics.final_docs_used}/{metrics.total_docs_retrieved}")
+                meta = message["metadata"]
+                with st.expander("📊 Détails de l'analyse", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("🌐 Langue détectée", meta.get("detected_language", "fr").upper())
+                    with col2:
+                        st.metric("⚖️ Domaine", meta.get("legal_domain", "general"))
+                    with col3:
+                        st.metric("📄 Documents analysés", f"{meta.get('documents_used', 0)}/{meta.get('documents_found', 0)}")
     
     # Chat input
-    if prompt := st.chat_input("Posez votre question juridique..."):
+    if prompt := st.chat_input("Tapez votre question juridique..."):
         # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.messages.append({"role": "user", "content": prompt, "metadata": {}})
         
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate assistant response
+        # Generate expert response
         with st.chat_message("assistant"):
-            with st.spinner("🔍 Recherche dans la base juridique..."):
-                try:
-                    answer, metrics = st.session_state.chatbot.generate_expert_answer(
-                        prompt, 
-                        legal_code=legal_code_filter,
-                        max_docs=max_docs
-                    )
-                    
-                    st.markdown(answer)
-                    
-                    # Store metrics
-                    st.session_state.chat_metrics.append(metrics)
-                    st.session_state.chat_count += 1
-                    
-                    # Show metrics in real-time if enabled
-                    if show_metrics:
-                        st.markdown("---")
-                        col1, col2, col3, col4 = st.columns(4)
+            st.markdown(f'<div class="expert-name">👨‍⚖️ Maître Khalil</div>', unsafe_allow_html=True)
+            
+            # Show thinking indicator
+            thinking_placeholder = st.empty()
+            thinking_placeholder.markdown('<div class="thinking-indicator">🤔 Analyse de votre question et recherche dans la jurisprudence...</div>', unsafe_allow_html=True)
+            
+            try:
+                # Get response from expert
+                response, metadata = st.session_state.expert.respond_to_question(
+                    prompt, 
+                    legal_code_filter=selected_code
+                )
+                
+                # Clear thinking indicator and show response
+                thinking_placeholder.empty()
+                st.markdown(response)
+                
+                # Store the response
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "metadata": metadata
+                })
+                
+                # Show analysis details
+                if metadata:
+                    with st.expander("📊 Détails de l'analyse", expanded=False):
+                        col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("⏱️ Recherche", f"{metrics.search_time:.2f}s")
+                            st.metric("🌐 Langue détectée", metadata.get("detected_language", "fr").upper())
                         with col2:
-                            st.metric("🔄 Re-classement", f"{metrics.rerank_time:.2f}s")
+                            st.metric("⚖️ Domaine", metadata.get("legal_domain", "general"))
                         with col3:
-                            st.metric("✍️ Synthèse", f"{metrics.synthesis_time:.2f}s")
-                        with col4:
-                            st.metric("📄 Documents", f"{metrics.final_docs_used}/{metrics.total_docs_retrieved}")
-                    
-                except Exception as e:
-                    error_message = f"❌ Erreur: {str(e)}"
-                    st.error(error_message)
-                    answer = error_message
-                    # Create dummy metrics for error case
-                    metrics = ChatMetrics(0, 0, 0, 0, 0)
-                    st.session_state.chat_metrics.append(metrics)
-        
-        # Add assistant message
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+                            st.metric("📄 Documents analysés", f"{metadata.get('documents_used', 0)}/{metadata.get('documents_found', 0)}")
+                
+            except Exception as e:
+                thinking_placeholder.empty()
+                error_msg = f"Je suis désolé, j'ai rencontré un problème technique. Pouvez-vous réessayer ? 🔧\n\nDétails: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": error_msg,
+                    "metadata": {}
+                })
     
-    # Footer with clear chat button
+    # Footer
     st.markdown("---")
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        st.markdown("""
+        <div style='font-size: 0.8em; color: #666;'>
+        ⚠️ <strong>Avertissement:</strong> Ces réponses sont à titre informatif uniquement. 
+        Pour des conseils juridiques personnalisés, consultez un avocat.
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col2:
-        if st.button("🗑️ Effacer l'historique"):
+        if st.button("🔄 Nouvelle consultation"):
             st.session_state.messages = []
-            st.session_state.chat_metrics = []
-            st.session_state.chat_count = 0
             st.rerun()
+    
+    with col3:
+        if st.button("📞 Contact direct"):
+            st.info("📧 khalil.ahmed@avocat.tn\n📱 +216 XX XXX XXX")
 
 if __name__ == "__main__":
     main()
